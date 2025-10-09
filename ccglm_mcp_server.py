@@ -256,6 +256,10 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
         model = args.get("model", "glm-4.6")
         env["ANTHROPIC_MODEL"] = model
 
+        # Debug logging para verificar configuración del modelo
+        logger.info(f"🎯 MODEL DEBUG: Requested={model}, ANTHROPIC_MODEL={env['ANTHROPIC_MODEL']}")
+        logger.info(f"🔧 ENVIRONMENT DEBUG: GLM_BASE_URL={GLM_BASE_URL}")
+
         # Comando Claude CLI con flags requeridos
         cmd = ["claude", "--dangerously-skip-permissions", "-c", "-p"]
 
@@ -343,25 +347,51 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
 
         final_response = {
             "response": response_text,
-            "model": model,
+            "model_requested": model,
+            "model_configured": env["ANTHROPIC_MODEL"],
+            "model_used": model,  # Esto debería verificarse con la API en el futuro
             "success": True,
             "timestamp": datetime.now().isoformat(),
             "execution_time": round(time.time() - start_time, 2),
             "exit_code": process.returncode,
             "files_created": len(new_files),
             "new_files": new_files[:10] if new_files else [],  # Limitar a primeros 10
-            "stderr": sanitize_for_log(stderr_text) if stderr_text else None
+            "stderr": sanitize_for_log(stderr_text) if stderr_text else None,
+            "debug_info": {
+                "glm_base_url": GLM_BASE_URL,
+                "claude_command": "claude --dangerously-skip-permissions -c -p"
+            }
         }
 
-        # Enhanced success logging
+        # Enhanced success logging con métricas detalladas
         ccglm_logger.log_process_event(
             context, "success",
             execution_time=final_response['execution_time'],
             exit_code=process.returncode,
             files_created=len(new_files),
-            response_length=len(response_text)
+            response_length=len(response_text),
+            model_requested=model,
+            model_configured=env["ANTHROPIC_MODEL"]
         )
+
+        # Logging detallado de rendimiento
         logger.info(f"🎉 GLM routing completed successfully in {final_response['execution_time']}s")
+        logger.info(f"📊 PERFORMANCE METRICS:")
+        logger.info(f"  Model requested: {model}")
+        logger.info(f"  Model configured: {env['ANTHROPIC_MODEL']}")
+        logger.info(f"  Execution time: {final_response['execution_time']}s")
+        logger.info(f"  Response length: {len(response_text)} chars")
+        logger.info(f"  Files created: {len(new_files)}")
+        logger.info(f"  Exit code: {process.returncode}")
+
+        # Alertas de rendimiento
+        if final_response['execution_time'] > 60:
+            logger.warning(f"⚠️  SLOW RESPONSE: {final_response['execution_time']}s exceeds 60s threshold")
+        elif final_response['execution_time'] > 30:
+            logger.warning(f"⚠️  MODERATE SLOW RESPONSE: {final_response['execution_time']}s exceeds 30s")
+
+        if model == "glm-4.5-air" and final_response['execution_time'] > 45:
+            logger.warning(f"🚨 FAST MODEL SLOW PERFORMANCE: glm-4.5-air took {final_response['execution_time']}s (should be <30s)")
         return final_response
 
     except FileNotFoundError:
@@ -390,6 +420,14 @@ async def main():
     logger.info("GLM routing mode - routes prompts via Claude CLI to Z.AI GLM backend")
     logger.info(f"GLM endpoint: {GLM_BASE_URL}")
     logger.info(f"Default timeout: {DEFAULT_TIMEOUT}s, Max timeout: {MAX_TIMEOUT}s")
+
+    # Debug logging inicial para variables de entorno
+    logger.info("🔧 ENVIRONMENT DEBUG AT STARTUP:")
+    logger.info(f"  GLM_BASE_URL: {GLM_BASE_URL}")
+    logger.info(f"  GLM_AUTH_TOKEN: {'***CONFIGURED***' if GLM_AUTH_TOKEN else 'NOT_CONFIGURED'}")
+    logger.info(f"  ANTHROPIC_MODEL (default): {os.getenv('ANTHROPIC_MODEL', 'NOT_SET')}")
+    logger.info(f"  ANTHROPIC_BASE_URL (env): {os.getenv('ANTHROPIC_BASE_URL', 'NOT_SET')}")
+    logger.info(f"  ANTHROPIC_AUTH_TOKEN (env): {'***SET***' if os.getenv('ANTHROPIC_AUTH_TOKEN') else 'NOT_SET'}")
 
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         logger.info("Server ready, waiting for connections...")
