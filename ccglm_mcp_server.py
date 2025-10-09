@@ -140,13 +140,19 @@ async def list_tools() -> List[types.Tool]:
     return [
         types.Tool(
             name="glm_route",
-            description="Route prompt to GLM-4.6 via Claude CLI (handles all tasks: code generation, analysis, general queries)",
+            description="Route prompt to GLM-4.6 (default) or glm-4.5-air (fast) via Claude CLI (handles all tasks: code generation, analysis, general queries)",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
                         "description": "The prompt to send to GLM"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model to use: glm-4.5-air (fast) or glm-4.6 (default)",
+                        "enum": ["glm-4.5-air", "glm-4.6"],
+                        "default": "glm-4.6"
                     }
                 },
                 "required": ["prompt"]
@@ -246,6 +252,10 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
         env["ANTHROPIC_BASE_URL"] = GLM_BASE_URL
         env["ANTHROPIC_AUTH_TOKEN"] = GLM_AUTH_TOKEN
 
+        # Seleccionar modelo
+        model = args.get("model", "glm-4.6")
+        env["ANTHROPIC_MODEL"] = model
+
         # Comando Claude CLI con flags requeridos
         cmd = ["claude", "--dangerously-skip-permissions", "-c", "-p"]
 
@@ -333,7 +343,7 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
 
         final_response = {
             "response": response_text,
-            "model": "glm-4.6",
+            "model": model,
             "success": True,
             "timestamp": datetime.now().isoformat(),
             "execution_time": round(time.time() - start_time, 2),
