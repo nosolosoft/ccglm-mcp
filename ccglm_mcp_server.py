@@ -36,9 +36,16 @@ load_dotenv()
 # Crear servidor MCP
 server = Server("ccglm-mcp")
 
-# Configuración de timeouts (mismo que CCR-MCP)
-DEFAULT_TIMEOUT = 300   # 5 minutos
-MAX_TIMEOUT = 1800      # 30 minutos
+# Configuración de timeouts optimizada para rendimiento
+DEFAULT_TIMEOUT = 120   # 2 minutos (reducido de 5 para respuestas más rápidas)
+MAX_TIMEOUT = 600       # 10 minutos (reducido de 30 para evitar esperas extremas)
+CONNECTION_TIMEOUT = 10 # 10 segundos para startup de subprocess
+
+# Timeouts específicos por modelo para optimización
+MODEL_TIMEOUTS = {
+    "glm-4.5-air": 120,    # 2 minutos para modelo rápido
+    "glm-4.6": 600        # 10 minutos para modelo completo
+}
 
 # Configuración GLM - cargada de variables de entorno o .env
 GLM_BASE_URL = os.getenv("GLM_BASE_URL", "https://api.z.ai/api/anthropic")
@@ -49,9 +56,27 @@ if not GLM_AUTH_TOKEN:
     logger.error("❌ GLM_AUTH_TOKEN no configurado. Debe estar en variables de entorno o archivo .env")
     sys.exit(1)
 
-def get_current_files(directory: str = ".") -> Set[str]:
-    """Obtener conjunto de archivos actuales (excluye directorios internos)"""
+# Cache para sistema de archivos optimizado
+_file_cache = {
+    "last_scan": 0,
+    "files": set(),
+    "directory": ""
+}
+
+def get_current_files(directory: str = ".", use_cache: bool = True) -> Set[str]:
+    """Obtener conjunto de archivos actuales con caché optimizada"""
+    global _file_cache
+
     try:
+        current_time = time.time()
+
+        # Usar caché si es reciente (menos de 5 segundos) y mismo directorio
+        if (use_cache and
+            _file_cache["directory"] == directory and
+            current_time - _file_cache["last_scan"] < 5):
+            return _file_cache["files"].copy()
+
+        # Escanear todos los archivos necesarios
         files = set()
         for root, dirs, filenames in os.walk(directory):
             # Excluir directorios internos
@@ -59,7 +84,16 @@ def get_current_files(directory: str = ".") -> Set[str]:
 
             for filename in filenames:
                 files.add(os.path.join(root, filename))
+
+        # Actualizar caché
+        _file_cache.update({
+            "last_scan": current_time,
+            "files": files.copy(),
+            "directory": directory
+        })
+
         return files
+
     except Exception as e:
         logger.warning(f"Error scanning directory {directory}: {e}")
         return set()
@@ -260,23 +294,38 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"🎯 MODEL DEBUG: Requested={model}, ANTHROPIC_MODEL={env['ANTHROPIC_MODEL']}")
         logger.info(f"🔧 ENVIRONMENT DEBUG: GLM_BASE_URL={GLM_BASE_URL}")
 
+        # Determinar timeout basado en modelo seleccionado
+        model_timeout = MODEL_TIMEOUTS.get(model, DEFAULT_TIMEOUT)
+        effective_timeout = min(model_timeout, MAX_TIMEOUT)
+
+        logger.info(f"⏱️ Using timeout: {effective_timeout}s for model {model}")
+
         # Comando Claude CLI con flags requeridos
         cmd = ["claude", "--dangerously-skip-permissions", "-c", "-p"]
 
-        # Crear proceso con comunicación stdin
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-            env=env
-        )
+        # Crear proceso con comunicación stdin y timeout de conexión
+        try:
+            process = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
+                    env=env
+                ),
+                timeout=CONNECTION_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Failed to start Claude CLI within {CONNECTION_TIMEOUT}s")
+            return {"error": f"Failed to start Claude CLI within {CONNECTION_TIMEOUT}s"}
 
         try:
-            # Enviar prompt por stdin y capturar salida
+            # Comunicación única y confiable con el subprocess
+            logger.info(f"🔄 Sending prompt to GLM model {model} (timeout: {effective_timeout}s)")
+
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(input=prompt.encode('utf-8')),
-                timeout=MAX_TIMEOUT
+                timeout=effective_timeout
             )
 
             # Decodificar salidas
@@ -300,10 +349,24 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            logger.error(f"⏰ GLM timed out after {MAX_TIMEOUT}s")
-            return {"error": f"Request timed out after {MAX_TIMEOUT}s"}
+            # Terminación graceful del proceso
+            logger.warning(f"⏰ GLM process timeout after {effective_timeout}s, terminating...")
+
+            # Intentar terminación graceful primero
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                        logger.info("✅ Process terminated gracefully")
+                    except asyncio.TimeoutError:
+                        logger.warning("Process didn't terminate gracefully, forcing kill")
+                        process.kill()
+                        await process.wait()
+                except ProcessLookupError:
+                    logger.info("Process already terminated")
+
+            return {"error": f"Request timed out after {effective_timeout}s for model {model}"}
 
         # Manejo mejorado de códigos de salida
         if process.returncode != 0:
@@ -384,14 +447,23 @@ async def glm_route(args: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"  Files created: {len(new_files)}")
         logger.info(f"  Exit code: {process.returncode}")
 
-        # Alertas de rendimiento
-        if final_response['execution_time'] > 60:
-            logger.warning(f"⚠️  SLOW RESPONSE: {final_response['execution_time']}s exceeds 60s threshold")
-        elif final_response['execution_time'] > 30:
-            logger.warning(f"⚠️  MODERATE SLOW RESPONSE: {final_response['execution_time']}s exceeds 30s")
+        # Alertas de rendimiento optimizadas para nuevos timeouts
+        if final_response['execution_time'] > effective_timeout * 0.8:
+            logger.warning(f"⚠️  SLOW RESPONSE: {final_response['execution_time']}s exceeds 80% of timeout ({effective_timeout}s)")
+        elif final_response['execution_time'] > effective_timeout * 0.5:
+            logger.warning(f"⚠️  MODERATE SLOW RESPONSE: {final_response['execution_time']}s exceeds 50% of timeout ({effective_timeout}s)")
 
-        if model == "glm-4.5-air" and final_response['execution_time'] > 45:
-            logger.warning(f"🚨 FAST MODEL SLOW PERFORMANCE: glm-4.5-air took {final_response['execution_time']}s (should be <30s)")
+        # Alertas específicas por modelo
+        if model == "glm-4.5-air":
+            if final_response['execution_time'] > 45:
+                logger.warning(f"🚨 FAST MODEL SLOW PERFORMANCE: glm-4.5-air took {final_response['execution_time']}s (timeout: 45s)")
+            elif final_response['execution_time'] > 30:
+                logger.warning(f"⚠️  FAST MODEL MODERATE: glm-4.5-air took {final_response['execution_time']}s (should be <30s)")
+        elif model == "glm-4.6":
+            if final_response['execution_time'] > 180:
+                logger.warning(f"🚨 FULL MODEL SLOW PERFORMANCE: glm-4.6 took {final_response['execution_time']}s (timeout: 180s)")
+            elif final_response['execution_time'] > 120:
+                logger.warning(f"⚠️  FULL MODEL MODERATE: glm-4.6 took {final_response['execution_time']}s (should be <120s)")
         return final_response
 
     except FileNotFoundError:
@@ -419,7 +491,7 @@ async def main():
     logger.info("CCGLM MCP Server starting...")
     logger.info("GLM routing mode - routes prompts via Claude CLI to Z.AI GLM backend")
     logger.info(f"GLM endpoint: {GLM_BASE_URL}")
-    logger.info(f"Default timeout: {DEFAULT_TIMEOUT}s, Max timeout: {MAX_TIMEOUT}s")
+    logger.info(f"Timeouts - Default: {DEFAULT_TIMEOUT}s, Max: {MAX_TIMEOUT}s, Models: {MODEL_TIMEOUTS}")
 
     # Debug logging inicial para variables de entorno
     logger.info("🔧 ENVIRONMENT DEBUG AT STARTUP:")

@@ -60,8 +60,8 @@ async def test_file_tracking():
 
     from ccglm_mcp_server import get_current_files, detect_new_files
 
-    # Get initial files
-    files_before = get_current_files(".")
+    # Get initial files (sin caché para asegurar detección)
+    files_before = get_current_files(".", use_cache=False)
     print(f"Files before: {len(files_before)}")
 
     # Create a test file
@@ -69,8 +69,8 @@ async def test_file_tracking():
     with open(test_file, "w") as f:
         f.write("test content")
 
-    # Get files after
-    files_after = get_current_files(".")
+    # Get files after (sin caché para asegurar detección de nuevos archivos)
+    files_after = get_current_files(".", use_cache=False)
     print(f"Files after: {len(files_after)}")
 
     # Detect new files
